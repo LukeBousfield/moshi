@@ -108,6 +108,10 @@ class LMModel(StreamingContainer):
         device=None,
         dtype=None,
         gradient_checkpointing: bool = False,
+        separate_semantic_proj: bool = False,
+        semantic_codebook_indices: tp.Optional[tp.List[int]] = None,
+        temporal_acoustic_codebooks: tp.Optional[int] = None,
+        temporal_acoustic_window: tp.Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
@@ -125,6 +129,39 @@ class LMModel(StreamingContainer):
         self.depformer_weights_per_step_schedule = depformer_weights_per_step_schedule
         if depformer_weights_per_step_schedule is not None:
             assert len(depformer_weights_per_step_schedule) == dep_q
+
+        # temporal_acoustic_window: when set, codebooks NOT in the filtered set
+        # are included for the FIRST N frames (all codebooks for early context,
+        # filtered set only after that). Only meaningful when
+        # temporal_acoustic_codebooks is also set.
+        # In streaming mode, a counter tracks the current frame position.
+        self._temporal_acoustic_window: tp.Optional[int] = temporal_acoustic_window
+        self._temporal_window_counter: int = 0
+
+        # Build set of audio codebook indices to include in Temporal Transformer input.
+        # temporal_acoustic_codebooks controls how many acoustic codebooks per stream
+        # are fed to the Temporal Transformer (None = all, 0 = semantic only).
+        # Semantic codebooks (delay=0) are always included.
+        if temporal_acoustic_codebooks is not None:
+            _included: tp.Set[int] = set()
+            # Group codebooks by stream: each stream starts with a delay=0 (semantic) codebook
+            stream_start = -1
+            acoustic_count = 0
+            for i, d in enumerate(delays[self.audio_offset:]):
+                if d == 0:
+                    # Semantic codebook — always included
+                    _included.add(i)
+                    stream_start = i
+                    acoustic_count = 0
+                else:
+                    # Acoustic codebook — include up to the limit per stream
+                    acoustic_count += 1
+                    if acoustic_count <= temporal_acoustic_codebooks:
+                        _included.add(i)
+            self._temporal_input_codebooks: tp.Optional[tp.Set[int]] = _included
+        else:
+            self._temporal_input_codebooks = None
+
         EmbeddingFactory = partial(
             ScaledEmbedding,
             norm=norm_emb,
@@ -137,6 +174,26 @@ class LMModel(StreamingContainer):
         )
         # Unlike for audio, here we authorize the model to output the special token.
         self.text_emb = EmbeddingFactory(text_card + 1, dim, demux_second_stream=demux_second_text_stream)
+
+        # Separated semantic/acoustic projections for disentangling semantic and acoustic
+        # information before the Temporal Transformer. When enabled, semantic embeddings
+        # (text + first codebook per stream) and acoustic embeddings (remaining codebooks)
+        # are projected through separate linear layers before being summed.
+        self.separate_semantic_proj = separate_semantic_proj
+        if separate_semantic_proj:
+            if semantic_codebook_indices is None:
+                # Auto-detect from delays: audio codebooks with delay=0 are semantic
+                semantic_codebook_indices = [
+                    i for i, d in enumerate(delays[self.audio_offset:])
+                    if d == 0
+                ]
+            self._semantic_codebook_indices: tp.Set[int] = set(semantic_codebook_indices)
+            self.semantic_proj = nn.Linear(dim, dim, bias=False, device=device, dtype=dtype)
+            self.acoustic_proj = nn.Linear(dim, dim, bias=False, device=device, dtype=dtype)
+        else:
+            self._semantic_codebook_indices = set()
+            self.semantic_proj = None
+            self.acoustic_proj = None
 
         self.text_linear = nn.Linear(dim, text_card_out, bias=bias_proj)
         depformer_prefix = "depformer_"
@@ -376,6 +433,11 @@ class LMModel(StreamingContainer):
         text_logits_mask &= (codes[:, :1] != self.zero_token_id)
         return LMOutput(logits, logits_mask, text_logits, text_logits_mask)
 
+    def reset_streaming(self, reset_mask: torch.Tensor | None = None) -> None:
+        super().reset_streaming(reset_mask)
+        if reset_mask is None:
+            self._temporal_window_counter = 0
+
     def forward_text(
         self,
         sequence: torch.Tensor, sum_condition: torch.Tensor | None = None,
@@ -386,15 +448,61 @@ class LMModel(StreamingContainer):
             K == self.num_codebooks
         ), f"Sequence shape {sequence.shape} must match the number of codebooks."
         input_sequence = sequence
-        input_ = None
-        for cb_index in range(self.num_audio_codebooks):
-            audio_emb = self.emb[cb_index](
-                input_sequence[:, cb_index + self.audio_offset]
-            )
-            input_ = audio_emb if input_ is None else input_ + audio_emb
         text_emb = self.text_emb(input_sequence[:, 0])
 
-        input_ = text_emb if input_ is None else input_ + text_emb
+        # Determine whether excluded codebooks should be included for this step.
+        # temporal_acoustic_window = N means: include ALL codebooks for the first
+        # N frames, then only the filtered set after that.
+        # For full-sequence (training): use a positional mask on the first N positions.
+        # For streaming (S=1): use a frame counter to decide.
+        include_all: bool = False
+        window_mask: tp.Optional[torch.Tensor] = None
+        if self._temporal_acoustic_window is not None and self._temporal_input_codebooks is not None:
+            if S == 1:
+                # Streaming: check if we're still within the first N frames
+                include_all = self._temporal_window_counter < self._temporal_acoustic_window
+                self._temporal_window_counter += 1
+            else:
+                # Full sequence: mask first N positions
+                window_mask = torch.zeros(1, S, 1, device=sequence.device, dtype=text_emb.dtype)
+                window_mask[:, :min(S, self._temporal_acoustic_window)] = 1.0
+
+        if self.separate_semantic_proj:
+            # Separate semantic and acoustic embeddings, project each independently.
+            semantic_sum = text_emb
+            acoustic_sum: tp.Optional[torch.Tensor] = None
+            for cb_index in range(self.num_audio_codebooks):
+                in_filtered = (self._temporal_input_codebooks is None or
+                               cb_index in self._temporal_input_codebooks)
+                if not in_filtered and not include_all and window_mask is None:
+                    continue
+                audio_emb = self.emb[cb_index](
+                    input_sequence[:, cb_index + self.audio_offset]
+                )
+                if not in_filtered and window_mask is not None:
+                    audio_emb = audio_emb * window_mask
+                if cb_index in self._semantic_codebook_indices:
+                    semantic_sum = semantic_sum + audio_emb
+                else:
+                    acoustic_sum = audio_emb if acoustic_sum is None else acoustic_sum + audio_emb
+            assert self.semantic_proj is not None and self.acoustic_proj is not None
+            input_ = self.semantic_proj(semantic_sum)
+            if acoustic_sum is not None:
+                input_ = input_ + self.acoustic_proj(acoustic_sum)
+        else:
+            input_ = None
+            for cb_index in range(self.num_audio_codebooks):
+                in_filtered = (self._temporal_input_codebooks is None or
+                               cb_index in self._temporal_input_codebooks)
+                if not in_filtered and not include_all and window_mask is None:
+                    continue
+                audio_emb = self.emb[cb_index](
+                    input_sequence[:, cb_index + self.audio_offset]
+                )
+                if not in_filtered and window_mask is not None:
+                    audio_emb = audio_emb * window_mask
+                input_ = audio_emb if input_ is None else input_ + audio_emb
+            input_ = text_emb if input_ is None else input_ + text_emb
         if sum_condition is not None:
             input_ = input_ + sum_condition.to(input_)
         if cross_attention_src is not None:
@@ -517,6 +625,11 @@ class LMModel(StreamingContainer):
 
         for linear in self.linears:
             _init_layer(linear)
+
+        if self.semantic_proj is not None:
+            nn.init.eye_(self.semantic_proj.weight)
+        if self.acoustic_proj is not None:
+            nn.init.eye_(self.acoustic_proj.weight)
 
 
 @dataclass

@@ -16,6 +16,7 @@ except ImportError:
 from safetensors.torch import load_file
 import sentencepiece
 import torch
+from torch import nn
 import typing as tp
 from .compression import MimiModel
 from ..conditioners import BaseConditioner, ConditionProvider, ConditionFuser
@@ -419,11 +420,27 @@ def get_moshi_lm(
                     else:
                         value = value.to(dtype)
                 state[key] = value
-            model.load_state_dict(state, assign=True)
-
+            res = model.load_state_dict(state, assign=True, strict=False)
         else:
             pkg = torch.load(filename, "cpu",)
-            model.load_state_dict(pkg["fsdp_best_state"]["model"], assign=True)
+            res = model.load_state_dict(pkg["fsdp_best_state"]["model"], assign=True, strict=False)
+
+        # Validate that only the separated projection keys are missing (if enabled).
+        _allowed_missing = {'semantic_proj.weight', 'acoustic_proj.weight'}
+        unexpected_missing = set(res.missing_keys) - _allowed_missing
+        if unexpected_missing:
+            raise RuntimeError(f"Missing keys in checkpoint: {unexpected_missing}")
+        if res.unexpected_keys:
+            raise RuntimeError(f"Unexpected keys in checkpoint: {res.unexpected_keys}")
+
+        # Initialize projection layers to identity on the real device if they weren't in the checkpoint.
+        if model.separate_semantic_proj and 'semantic_proj.weight' in res.missing_keys:
+            model.semantic_proj.weight = nn.Parameter(
+                torch.eye(model.dim, device=device, dtype=dtype)
+            )
+            model.acoustic_proj.weight = nn.Parameter(
+                torch.eye(model.dim, device=device, dtype=dtype)
+            )
 
     if lora:
         assert not lm_kwargs.get("quantize"), (

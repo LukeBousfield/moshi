@@ -192,6 +192,14 @@ def main():
                         help="Do not fuse LoRA layers intot Linear layers.")
     parser.add_argument("--half", action="store_const", const=torch.float16, default=torch.bfloat16,
                         dest="dtype", help="Run inference with float16, not bfloat16, better for old GPUs.")
+    parser.add_argument("--separate-semantic-proj", action="store_true",
+                        help="Enable separated semantic/acoustic projection layers.")
+    parser.add_argument("--temporal-acoustic-codebooks", type=int, default=None,
+                        help="Number of acoustic codebooks per stream to feed the Temporal Transformer "
+                             "(0=semantic only, None=all). Reduces noise in the temporal representation.")
+    parser.add_argument("--temporal-acoustic-window", type=int, default=None,
+                        help="Number of initial frames that include ALL acoustic codebooks. "
+                             "After this many frames, only --temporal-acoustic-codebooks are used.")
     parser.add_argument(
         "--ssl",
         type=str,
@@ -230,7 +238,16 @@ def main():
     text_tokenizer = checkpoint_info.get_text_tokenizer()
 
     log("info", "loading moshi")
-    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora)
+    lm_overrides = {}
+    if args.separate_semantic_proj:
+        lm_overrides["separate_semantic_proj"] = True
+    if args.temporal_acoustic_codebooks is not None:
+        lm_overrides["temporal_acoustic_codebooks"] = args.temporal_acoustic_codebooks
+    if args.temporal_acoustic_window is not None:
+        lm_overrides["temporal_acoustic_window"] = args.temporal_acoustic_window
+    lm = checkpoint_info.get_moshi(
+        device=args.device, dtype=args.dtype, fuse_lora=args.fuse_lora,
+        lm_kwargs_overrides=lm_overrides)
     log("info", "moshi loaded")
 
     state = ServerState(checkpoint_info.model_type, mimi, text_tokenizer, lm, args.cfg_coef, args.device,
